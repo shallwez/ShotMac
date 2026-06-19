@@ -17,3 +17,4 @@
 ```sh
 make app
 ```
+<img width="713" height="591" alt="截屏2026-06-19 15 16 54" src="https://github.com/user-attachments/assets/4f788b2e-3824-488d-8c53-cb4aa325a8c1" />
