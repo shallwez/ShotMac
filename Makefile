@@ -26,7 +26,6 @@ app:
 		-framework Carbon \
 		-framework CoreGraphics \
 		-framework ScreenCaptureKit \
-		-framework ServiceManagement \
 		Sources/*.swift \
 		-o "$(MACOS)/$(APP_NAME)"
 	swiftc -swift-version 5 -O \
@@ -35,7 +34,6 @@ app:
 		-framework Carbon \
 		-framework CoreGraphics \
 		-framework ScreenCaptureKit \
-		-framework ServiceManagement \
 		Sources/*.swift \
 		-o "$(BIN)"
 	xattr -cr "$(APP_DIR)"

@@ -1,11 +1,18 @@
 import AppKit
 import Carbon
 import CoreGraphics
+import Darwin
 import ScreenCaptureKit
-import ServiceManagement
+import UniformTypeIdentifiers
 
 private let hotKeySignature = OSType(0x514d5348) // QMSH
 private let hotKeyID = UInt32(1)
+private let launchAgentLabel = "local.quickmarkshot.loginitem"
+
+enum CaptureAction {
+    case copy
+    case save
+}
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
@@ -13,8 +20,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotKeyRef: EventHotKeyRef?
     private var eventHandlerRef: EventHandlerRef?
     private var captureWindow: CaptureWindow?
-    private var editorWindow: NSWindow?
-    private var editorToolbarWindow: NSWindow?
     private var hotKeyRegistrationStatus: OSStatus = noErr
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -49,9 +54,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         NSApp.activate(ignoringOtherApps: true)
         captureWindow?.orderOut(nil)
-        captureWindow = CaptureWindow { [weak self] rect, annotations in
+        captureWindow = CaptureWindow { [weak self] rect, annotations, action in
             guard let rect, let annotations else { return }
-            self?.capture(rect: rect, annotations: annotations)
+            self?.capture(rect: rect, annotations: annotations, action: action)
         }
         captureWindow?.makeKeyAndOrderFront(nil)
     }
@@ -100,24 +105,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateLaunchAtLogin(enabled: Bool, reportErrors: Bool) {
-        launchAtLoginItem?.state = enabled ? .on : .off
-        Task { @MainActor in
-            do {
-                if enabled {
-                    if SMAppService.mainApp.status == .notRegistered {
-                        try SMAppService.mainApp.register()
-                    }
-                } else if SMAppService.mainApp.status != .notRegistered {
-                    try await SMAppService.mainApp.unregister()
-                }
-            } catch {
-                UserDefaults.standard.set(!enabled, forKey: "LaunchAtLogin")
-                launchAtLoginItem?.state = enabled ? .off : .on
-                NSLog("QuickMarkShot launch-at-login error: %@", error.localizedDescription)
-                if reportErrors {
-                    showAlert(title: "开机启动设置失败", message: error.localizedDescription)
-                }
+        do {
+            try setLaunchAtLogin(enabled: enabled)
+            launchAtLoginItem?.state = enabled ? .on : .off
+        } catch {
+            UserDefaults.standard.set(!enabled, forKey: "LaunchAtLogin")
+            launchAtLoginItem?.state = enabled ? .off : .on
+            NSLog("QuickMarkShot launch-at-login error: %@", error.localizedDescription)
+            if reportErrors {
+                showAlert(title: "开机启动设置失败", message: error.localizedDescription)
             }
+        }
+    }
+
+    private var launchAgentURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library")
+            .appendingPathComponent("LaunchAgents")
+            .appendingPathComponent("\(launchAgentLabel).plist")
+    }
+
+    private func setLaunchAtLogin(enabled: Bool) throws {
+        let fileManager = FileManager.default
+        let agentURL = launchAgentURL
+        let launchAgentsURL = agentURL.deletingLastPathComponent()
+
+        if enabled {
+            try fileManager.createDirectory(at: launchAgentsURL, withIntermediateDirectories: true)
+            let plist: [String: Any] = [
+                "Label": launchAgentLabel,
+                "ProgramArguments": ["/usr/bin/open", Bundle.main.bundleURL.path],
+                "RunAtLoad": true
+            ]
+            let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            try data.write(to: agentURL, options: .atomic)
+            reloadLaunchAgent(at: agentURL)
+        } else {
+            unloadLaunchAgent(at: agentURL)
+            if fileManager.fileExists(atPath: agentURL.path) {
+                try fileManager.removeItem(at: agentURL)
+            }
+        }
+    }
+
+    private func reloadLaunchAgent(at url: URL) {
+        unloadLaunchAgent(at: url)
+        _ = runLaunchctl(arguments: ["bootstrap", "gui/\(getuid())", url.path])
+    }
+
+    private func unloadLaunchAgent(at url: URL) {
+        _ = runLaunchctl(arguments: ["bootout", "gui/\(getuid())", url.path])
+    }
+
+    @discardableResult
+    private func runLaunchctl(arguments: [String]) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = arguments
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            NSLog("QuickMarkShot launchctl error: %@", error.localizedDescription)
+            return false
         }
     }
 
@@ -139,68 +193,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSLog("QuickMarkShot hotkey handler=%d registration=%d", handlerStatus, hotKeyRegistrationStatus)
     }
 
-    private func capture(rect: CGRect, annotations: [Annotation]) {
+    private func capture(rect: CGRect, annotations: [Annotation], action: CaptureAction) {
         let imageRect = rect.standardized.integral
         guard imageRect.width > 2, imageRect.height > 2 else { return }
         Task { @MainActor in
             do {
                 let image = try await captureImage(in: imageRect)
-                Clipboard.write(image: render(image: image, annotations: annotations))
+                let rendered = render(image: image, annotations: annotations)
+                switch action {
+                case .copy:
+                    Clipboard.write(image: rendered)
+                    SoundFeedback.playSuccess()
+                case .save:
+                    save(image: rendered)
+                }
             } catch {
                 showAlert(title: "截图失败", message: "没有拿到屏幕图像，请确认屏幕录制权限已经开启。\n\(error.localizedDescription)")
             }
         }
     }
 
+    private func save(image: NSImage) {
+        guard let data = image.pngData else {
+            showAlert(title: "保存失败", message: "无法生成 PNG 图片。")
+            return
+        }
+
+        NSApp.activate(ignoringOtherApps: true)
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.png]
+        panel.canCreateDirectories = true
+        panel.isExtensionHidden = false
+        panel.directoryURL = FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask).first
+        panel.nameFieldStringValue = "QuickMarkShot-\(Self.fileTimestamp()).png"
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            do {
+                try data.write(to: url, options: .atomic)
+                SoundFeedback.playSuccess()
+            } catch {
+                self?.showAlert(title: "保存失败", message: error.localizedDescription)
+            }
+        }
+    }
+
+    private static func fileTimestamp() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        return formatter.string(from: Date())
+    }
+
     private func render(image: NSImage, annotations: [Annotation]) -> NSImage {
         let result = NSImage(size: image.size)
         result.lockFocus()
         image.draw(in: CGRect(origin: .zero, size: image.size), from: .zero, operation: .copy, fraction: 1)
-        annotations.forEach(drawAnnotation)
+        annotations.forEach { $0.draw() }
         result.unlockFocus()
         return result
-    }
-
-    private func drawAnnotation(_ annotation: Annotation) {
-        switch annotation {
-        case let .text(text, point, size, color):
-            text.draw(at: point, withAttributes: [
-                .font: NSFont.systemFont(ofSize: size, weight: .semibold),
-                .foregroundColor: color
-            ])
-        case let .rectangle(rect, color):
-            color.setStroke()
-            let path = NSBezierPath(roundedRect: rect, xRadius: 3, yRadius: 3)
-            path.lineWidth = 4
-            path.stroke()
-        case let .arrow(start, end, color):
-            color.setStroke()
-            let path = NSBezierPath()
-            path.move(to: start)
-            path.line(to: end)
-            path.lineWidth = 4
-            path.lineCapStyle = .round
-            path.stroke()
-            let angle = atan2(end.y - start.y, end.x - start.x)
-            let length: CGFloat = 16
-            let head = NSBezierPath()
-            head.move(to: end)
-            head.line(to: CGPoint(x: end.x - length * cos(angle - .pi / 6), y: end.y - length * sin(angle - .pi / 6)))
-            head.move(to: end)
-            head.line(to: CGPoint(x: end.x - length * cos(angle + .pi / 6), y: end.y - length * sin(angle + .pi / 6)))
-            head.lineWidth = 4
-            head.stroke()
-        case let .pen(points, color):
-            color.setStroke()
-            guard let first = points.first else { return }
-            let path = NSBezierPath()
-            path.move(to: first)
-            points.dropFirst().forEach { path.line(to: $0) }
-            path.lineWidth = 4
-            path.lineCapStyle = .round
-            path.lineJoinStyle = .round
-            path.stroke()
-        }
     }
 
     private func captureImage(in selection: CGRect) async throws -> NSImage {
@@ -236,64 +285,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return NSImage(cgImage: cgImage, size: clipped.size)
     }
 
-    private func showEditor(image: NSImage, selection: CGRect, initialTool: AnnotationTool) {
-        closeEditor()
-
-        let controller = EditorViewController(image: image, initialTool: initialTool) { [weak self] in
-            self?.closeEditor()
-        }
-        let contentSize = image.size
-        let window = EditorWindow(contentRect: CGRect(origin: selection.origin, size: contentSize), styleMask: [.borderless], backing: .buffered, defer: false)
-        window.contentViewController = controller
-        window.level = .screenSaver
-        window.animationBehavior = .none
-        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-        window.hidesOnDeactivate = false
-        window.isReleasedWhenClosed = false
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.hasShadow = false
-        window.setFrame(CGRect(origin: selection.origin, size: contentSize), display: false)
-
-        let toolbarSize = CGSize(width: 444, height: 48)
-        let toolbarController = EditorToolbarViewController(canvas: controller.canvas, initialTool: initialTool)
-        let toolbarWindow = EditorToolbarWindow(contentRect: CGRect(origin: .zero, size: toolbarSize),
-                                                styleMask: [.borderless], backing: .buffered, defer: false)
-        toolbarWindow.contentViewController = toolbarController
-        toolbarWindow.level = .screenSaver
-        toolbarWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-        toolbarWindow.hidesOnDeactivate = false
-        toolbarWindow.isReleasedWhenClosed = false
-        toolbarWindow.isOpaque = false
-        toolbarWindow.backgroundColor = .clear
-        toolbarWindow.hasShadow = true
-
-        let screen = NSScreen.screens.first(where: { $0.frame.intersects(selection) }) ?? NSScreen.main
-        var toolbarOrigin = CGPoint(x: selection.maxX - toolbarSize.width,
-                                    y: selection.minY - toolbarSize.height - 6)
-        if let visibleFrame = screen?.visibleFrame {
-            toolbarOrigin.x = min(max(toolbarOrigin.x, visibleFrame.minX), visibleFrame.maxX - toolbarSize.width)
-            if toolbarOrigin.y < visibleFrame.minY {
-                toolbarOrigin.y = min(selection.maxY + 6, visibleFrame.maxY - toolbarSize.height)
-            }
-        }
-        toolbarWindow.setFrameOrigin(toolbarOrigin)
-        NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
-        window.orderFrontRegardless()
-        window.makeFirstResponder(controller.canvas)
-        toolbarWindow.orderFrontRegardless()
-        editorWindow = window
-        editorToolbarWindow = toolbarWindow
-    }
-
-    private func closeEditor() {
-        editorToolbarWindow?.orderOut(nil)
-        editorWindow?.orderOut(nil)
-        editorToolbarWindow = nil
-        editorWindow = nil
-    }
-
     private func showAlert(title: String, message: String) {
         let alert = NSAlert()
         alert.messageText = title
@@ -315,15 +306,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-final class EditorWindow: NSWindow {
-    override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { true }
-}
-
-final class EditorToolbarWindow: NSPanel {
-    override var canBecomeKey: Bool { true }
-}
-
 private enum CaptureError: LocalizedError {
     case displayNotFound
     case emptySelection
@@ -337,9 +319,9 @@ private enum CaptureError: LocalizedError {
 }
 
 final class CaptureWindow: NSWindow {
-    private let completion: (CGRect?, [Annotation]?) -> Void
+    private let completion: (CGRect?, [Annotation]?, CaptureAction) -> Void
 
-    init(completion: @escaping (CGRect?, [Annotation]?) -> Void) {
+    init(completion: @escaping (CGRect?, [Annotation]?, CaptureAction) -> Void) {
         self.completion = completion
         let frame = NSScreen.screens.reduce(CGRect.null) { $0.union($1.frame) }
         super.init(contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false)
@@ -349,9 +331,9 @@ final class CaptureWindow: NSWindow {
         level = .screenSaver
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         ignoresMouseEvents = false
-        contentView = CaptureView(frame: CGRect(origin: .zero, size: frame.size)) { [weak self] rect, annotations in
+        contentView = CaptureView(frame: CGRect(origin: .zero, size: frame.size)) { [weak self] rect, annotations, action in
             self?.orderOut(nil)
-            self?.completion(rect, annotations)
+            self?.completion(rect, annotations, action)
         }
     }
 
@@ -359,7 +341,7 @@ final class CaptureWindow: NSWindow {
 }
 
 final class CaptureView: NSView, NSTextFieldDelegate {
-    private typealias ActionButtons = (tools: [(tool: AnnotationTool, rect: CGRect)], undo: CGRect, fontSize: CGRect?, colors: [(color: NSColor, rect: CGRect)], copy: CGRect, cancel: CGRect, bar: CGRect)
+    private typealias ActionButtons = (tools: [(tool: AnnotationTool, rect: CGRect)], undo: CGRect, fontSize: CGRect?, strokeWidths: [(width: CGFloat, rect: CGRect)], colors: [(color: NSColor, rect: CGRect)], save: CGRect, cancel: CGRect, bar: CGRect)
 
     private enum ResizeHandle {
         case left, right, bottom, top
@@ -381,16 +363,24 @@ final class CaptureView: NSView, NSTextFieldDelegate {
     private var annotationStart: CGPoint?
     private var annotationCurrent: CGPoint?
     private var penPoints: [CGPoint] = []
+    private var pendingTextIndex: Int?
+    private var pendingTextOffset: CGPoint?
+    private var pendingTextMouseDownPoint: CGPoint?
+    private var draggingTextIndex: Int?
+    private var draggingTextOffset: CGPoint?
     private var activeTextField: NSTextField?
     private var activeTextPoint: CGPoint?
-    private var textSize: CGFloat = 28
+    private var activeTextEditingIndex: Int?
+    private var textSize: CGFloat = 18
     private var textColor: NSColor = .systemRed
+    private var annotationLineWidth: CGFloat = defaultAnnotationLineWidth
+    private let lineWidthOptions: [CGFloat] = [2, 4]
     private let textSizeOptions: [CGFloat] = Array(stride(from: CGFloat(12), through: CGFloat(64), by: CGFloat(2)))
     private var hoverPoint: CGPoint?
     private var trackingArea: NSTrackingArea?
-    private let completion: (CGRect?, [Annotation]?) -> Void
+    private let completion: (CGRect?, [Annotation]?, CaptureAction) -> Void
 
-    init(frame: CGRect, completion: @escaping (CGRect?, [Annotation]?) -> Void) {
+    init(frame: CGRect, completion: @escaping (CGRect?, [Annotation]?, CaptureAction) -> Void) {
         self.completion = completion
         super.init(frame: frame)
         wantsLayer = true
@@ -427,13 +417,14 @@ final class CaptureView: NSView, NSTextFieldDelegate {
         if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "z" {
             undoLastAnnotation()
         } else if event.keyCode == kVK_Escape {
-            completion(nil, nil)
+            completion(nil, nil, .copy)
         } else if event.keyCode == kVK_Return || event.keyCode == kVK_ANSI_KeypadEnter {
-            copySelection()
+            finishSelection(.copy)
         } else if lockedSelection != nil, let key = event.charactersIgnoringModifiers?.lowercased() {
             switch key {
             case "t": selectTool(.text)
             case "r": selectTool(.rectangle)
+            case "o": selectTool(.oval)
             case "a": selectTool(.arrow)
             case "p": selectTool(.pen)
             case "-", "–":
@@ -454,13 +445,13 @@ final class CaptureView: NSView, NSTextFieldDelegate {
                 let buttons = actionButtonRects(for: lockedSelection)
                 if !isPointInToolbar(point, buttons: buttons), !lockedSelection.contains(point) {
                     commitTextEntry()
-                    completion(nil, nil)
+                    completion(nil, nil, .copy)
                     return
                 }
             }
             commitTextEntry()
             if let lockedSelection, lockedSelection.contains(point), event.clickCount == 2 {
-                copySelection()
+                finishSelection(.copy)
             }
             return
         }
@@ -480,6 +471,11 @@ final class CaptureView: NSView, NSTextFieldDelegate {
                 showTextSizeMenu(from: fontSize)
                 return
             }
+            if let selectedWidth = buttons.strokeWidths.first(where: { $0.rect.contains(point) }) {
+                annotationLineWidth = selectedWidth.width
+                needsDisplay = true
+                return
+            }
             if let selectedColor = buttons.colors.first(where: { $0.rect.contains(point) }) {
                 textColor = selectedColor.color
                 activeTextField?.textColor = selectedColor.color
@@ -487,17 +483,17 @@ final class CaptureView: NSView, NSTextFieldDelegate {
                 needsDisplay = true
                 return
             }
-            if buttons.copy.contains(point) {
-                copySelection()
+            if buttons.save.contains(point) {
+                finishSelection(.save)
                 return
             }
             if buttons.cancel.contains(point) {
-                completion(nil, nil)
+                completion(nil, nil, .copy)
                 return
             }
             if lockedSelection.contains(point), event.clickCount == 2 {
                 commitTextEntry()
-                copySelection()
+                finishSelection(.copy)
                 return
             }
             if let handle = resizeHandle(at: point, for: lockedSelection) {
@@ -509,6 +505,9 @@ final class CaptureView: NSView, NSTextFieldDelegate {
             if let activeTool, lockedSelection.contains(point) {
                 commitTextEntry()
                 let localPoint = CGPoint(x: point.x - lockedSelection.minX, y: point.y - lockedSelection.minY)
+                if prepareTextInteraction(at: localPoint, mousePoint: point) {
+                    return
+                }
                 if activeTool == .text {
                     beginTextEntry(at: localPoint, viewPoint: point)
                     return
@@ -520,11 +519,15 @@ final class CaptureView: NSView, NSTextFieldDelegate {
             }
             if lockedSelection.contains(point) {
                 commitTextEntry()
+                let localPoint = CGPoint(x: point.x - lockedSelection.minX, y: point.y - lockedSelection.minY)
+                if prepareTextInteraction(at: localPoint, mousePoint: point) {
+                    return
+                }
                 moveOffset = CGPoint(x: point.x - lockedSelection.minX,
                                      y: point.y - lockedSelection.minY)
                 return
             }
-            completion(nil, nil)
+            completion(nil, nil, .copy)
             return
         }
         startPoint = point
@@ -533,6 +536,26 @@ final class CaptureView: NSView, NSTextFieldDelegate {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if let textIndex = pendingTextIndex,
+           let offset = pendingTextOffset,
+           let mouseDownPoint = pendingTextMouseDownPoint {
+            let point = event.locationInWindow
+            if hypot(point.x - mouseDownPoint.x, point.y - mouseDownPoint.y) < 3 {
+                return
+            }
+            draggingTextIndex = textIndex
+            draggingTextOffset = offset
+            pendingTextIndex = nil
+            pendingTextOffset = nil
+            pendingTextMouseDownPoint = nil
+            moveTextAnnotation(at: textIndex, offset: offset, to: point)
+            return
+        }
+        if let textIndex = draggingTextIndex,
+           let offset = draggingTextOffset {
+            moveTextAnnotation(at: textIndex, offset: offset, to: event.locationInWindow)
+            return
+        }
         if let activeTool, let lockedSelection, annotationStart != nil {
             let point = event.locationInWindow
             let localPoint = CGPoint(x: min(max(point.x, lockedSelection.minX), lockedSelection.maxX) - lockedSelection.minX,
@@ -578,16 +601,32 @@ final class CaptureView: NSView, NSTextFieldDelegate {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if let textIndex = pendingTextIndex {
+            pendingTextIndex = nil
+            pendingTextOffset = nil
+            pendingTextMouseDownPoint = nil
+            beginEditingTextAnnotation(at: textIndex)
+            return
+        }
+        if draggingTextIndex != nil {
+            draggingTextIndex = nil
+            draggingTextOffset = nil
+            updateCursor(at: event.locationInWindow)
+            needsDisplay = true
+            return
+        }
         if let activeTool, let start = annotationStart, let end = annotationCurrent {
             switch activeTool {
             case .text:
                 break
             case .rectangle:
-                annotations.append(.rectangle(CGRect(x: min(start.x, end.x), y: min(start.y, end.y), width: abs(start.x - end.x), height: abs(start.y - end.y)), textColor))
+                annotations.append(.rectangle(rect(from: start, to: end), textColor, annotationLineWidth))
+            case .oval:
+                annotations.append(.oval(rect(from: start, to: end), textColor, annotationLineWidth))
             case .arrow:
-                annotations.append(.arrow(start, end, textColor))
+                annotations.append(.arrow(start, end, textColor, annotationLineWidth))
             case .pen:
-                if penPoints.count > 1 { annotations.append(.pen(penPoints, textColor)) }
+                if penPoints.count > 1 { annotations.append(.pen(penPoints, textColor, annotationLineWidth)) }
             }
             annotationStart = nil
             annotationCurrent = nil
@@ -639,7 +678,9 @@ final class CaptureView: NSView, NSTextFieldDelegate {
         let transform = NSAffineTransform()
         transform.translateX(by: rect.minX, yBy: rect.minY)
         transform.concat()
-        annotations.forEach(drawAnnotation)
+        for (index, annotation) in annotations.enumerated() where index != activeTextEditingIndex {
+            annotation.draw()
+        }
         drawAnnotationPreview()
         NSGraphicsContext.restoreGraphicsState()
 
@@ -723,8 +764,11 @@ final class CaptureView: NSView, NSTextFieldDelegate {
         } else if let handle = resizeHandle(at: point, for: selection) {
             cursor(for: handle).set()
         } else if selection.contains(point) {
-            if moveOffset != nil {
+            let localPoint = CGPoint(x: point.x - selection.minX, y: point.y - selection.minY)
+            if moveOffset != nil || draggingTextIndex != nil {
                 NSCursor.closedHand.set()
+            } else if textAnnotationIndex(at: localPoint) != nil {
+                NSCursor.openHand.set()
             } else if activeTool == .text {
                 NSCursor.iBeam.set()
             } else if activeTool != nil {
@@ -750,19 +794,20 @@ final class CaptureView: NSView, NSTextFieldDelegate {
         }
     }
 
-    private func copySelection() {
+    private func finishSelection(_ action: CaptureAction) {
         commitTextEntry()
         guard let selection = lockedSelection, let window else { return }
         let origin = window.convertPoint(toScreen: selection.origin)
         let maxPoint = window.convertPoint(toScreen: CGPoint(x: selection.maxX, y: selection.maxY))
         completion(CGRect(x: origin.x, y: origin.y,
                           width: maxPoint.x - origin.x,
-                          height: maxPoint.y - origin.y).standardized, annotations)
+                          height: maxPoint.y - origin.y).standardized, annotations, action)
     }
 
     private func actionButtonRects(for selection: CGRect) -> ActionButtons {
         let showFontSize = isTextControlsVisible
-        let barSize = CGSize(width: showFontSize ? 614 : 538, height: 50)
+        let showStrokeWidths = activeTool?.usesLineWidthControls == true
+        let barSize = CGSize(width: showFontSize ? 632 : (showStrokeWidths ? 668 : 580), height: 50)
         let x = min(max(selection.maxX - barSize.width, bounds.minX + 4), bounds.maxX - barSize.width - 4)
         let y = selection.minY >= barSize.height + 8
             ? selection.minY - barSize.height - 10
@@ -772,12 +817,16 @@ final class CaptureView: NSView, NSTextFieldDelegate {
             (color: color, rect: CGRect(x: bar.minX + 12 + CGFloat(index) * 28,
                                         y: bar.minY + 14, width: 22, height: 22))
         }
-        let fontSize = showFontSize ? CGRect(x: bar.minX + 166, y: bar.minY + 7, width: 64, height: 36) : nil
-        let undoX = showFontSize ? bar.minX + 242 : bar.minX + 166
+        let fontSize = showFontSize ? CGRect(x: bar.minX + 158, y: bar.minY + 7, width: 52, height: 36) : nil
+        let strokeWidths = showStrokeWidths ? lineWidthOptions.enumerated().map { index, width in
+            (width: width, rect: CGRect(x: bar.minX + 158 + CGFloat(index) * 42,
+                                        y: bar.minY + 7, width: 36, height: 36))
+        } : []
+        let undoX = showFontSize ? bar.minX + 222 : (showStrokeWidths ? bar.minX + 254 : bar.minX + 166)
         let undo = CGRect(x: undoX, y: bar.minY + 7, width: 36, height: 36)
         let cancel = CGRect(x: undo.maxX + 8, y: bar.minY + 7, width: 36, height: 36)
         let toolsStartX = cancel.maxX + 18
-        let toolValues: [AnnotationTool] = [.text, .rectangle, .arrow, .pen]
+        let toolValues: [AnnotationTool] = [.text, .rectangle, .oval, .arrow, .pen]
         let tools = toolValues.enumerated().map { index, tool in
             (tool: tool, rect: CGRect(x: toolsStartX + CGFloat(index) * 42,
                                      y: bar.minY + 7, width: 36, height: 36))
@@ -786,8 +835,9 @@ final class CaptureView: NSView, NSTextFieldDelegate {
             tools: tools,
             undo: undo,
             fontSize: fontSize,
+            strokeWidths: strokeWidths,
             colors: colors,
-            copy: CGRect(x: bar.maxX - 94, y: bar.minY + 7, width: 84, height: 36),
+            save: CGRect(x: bar.maxX - 94, y: bar.minY + 7, width: 84, height: 36),
             cancel: cancel,
             bar: bar
         )
@@ -798,8 +848,9 @@ final class CaptureView: NSView, NSTextFieldDelegate {
             || buttons.tools.contains(where: { $0.rect.contains(point) })
             || buttons.undo.contains(point)
             || (buttons.fontSize?.contains(point) ?? false)
+            || buttons.strokeWidths.contains(where: { $0.rect.contains(point) })
             || buttons.colors.contains(where: { $0.rect.contains(point) })
-            || buttons.copy.contains(point)
+            || buttons.save.contains(point)
             || buttons.cancel.contains(point)
     }
 
@@ -824,6 +875,15 @@ final class CaptureView: NSView, NSTextFieldDelegate {
             drawToolbarSeparator(x: fontSize.minX - 12, bar: buttons.bar)
             drawFontSizeButton(rect: fontSize, hovered: isHovered(fontSize))
         }
+        if let firstStrokeWidth = buttons.strokeWidths.first {
+            drawToolbarSeparator(x: firstStrokeWidth.rect.minX - 12, bar: buttons.bar)
+            for item in buttons.strokeWidths {
+                drawStrokeWidthButton(rect: item.rect,
+                                      width: item.width,
+                                      active: item.width == annotationLineWidth,
+                                      hovered: isHovered(item.rect))
+            }
+        }
         if let firstColor = buttons.colors.first {
             drawToolbarSeparator(x: firstColor.rect.minX - 12, bar: buttons.bar)
         }
@@ -835,9 +895,9 @@ final class CaptureView: NSView, NSTextFieldDelegate {
             outline.lineWidth = item.color.isEqual(textColor) ? 2.2 : 1
             outline.stroke()
         }
-        drawPrimaryButton(buttons.copy, hovered: isHovered(buttons.copy))
-        drawToolbarIcon("doc.on.doc", fallback: "⧉", in: CGRect(x: buttons.copy.minX + 9, y: buttons.copy.minY, width: 24, height: buttons.copy.height))
-        "复制".draw(at: CGPoint(x: buttons.copy.minX + 36, y: buttons.copy.minY + 10), withAttributes: [
+        drawPrimaryButton(buttons.save, hovered: isHovered(buttons.save))
+        drawToolbarIcon("square.and.arrow.down", fallback: "↓", in: CGRect(x: buttons.save.minX + 9, y: buttons.save.minY, width: 24, height: buttons.save.height))
+        "保存".draw(at: CGPoint(x: buttons.save.minX + 36, y: buttons.save.minY + 10), withAttributes: [
             .font: NSFont.systemFont(ofSize: 13, weight: .semibold), .foregroundColor: NSColor.white
         ])
     }
@@ -899,13 +959,37 @@ final class CaptureView: NSView, NSTextFieldDelegate {
 
     private func drawFontSizeButton(rect: CGRect, hovered: Bool = false) {
         drawToolbarButton(rect, active: false, hovered: hovered)
-        let title = "\(Int(textSize))⌄"
+        let title = "\(Int(textSize))"
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
             .foregroundColor: NSColor.white
         ]
         let size = title.size(withAttributes: attrs)
-        title.draw(at: CGPoint(x: rect.midX - size.width / 2, y: rect.minY + 9), withAttributes: attrs)
+        let contentWidth = size.width + 11
+        title.draw(at: CGPoint(x: rect.midX - contentWidth / 2, y: rect.minY + 9), withAttributes: attrs)
+
+        let chevronX = rect.midX + contentWidth / 2 - 7
+        let chevronY = rect.midY - 2
+        let chevron = NSBezierPath()
+        chevron.move(to: CGPoint(x: chevronX, y: chevronY + 3))
+        chevron.line(to: CGPoint(x: chevronX + 4, y: chevronY - 1))
+        chevron.line(to: CGPoint(x: chevronX + 8, y: chevronY + 3))
+        chevron.lineWidth = 1.8
+        chevron.lineCapStyle = .round
+        chevron.lineJoinStyle = .round
+        NSColor.white.withAlphaComponent(0.9).setStroke()
+        chevron.stroke()
+    }
+
+    private func drawStrokeWidthButton(rect: CGRect, width: CGFloat, active: Bool, hovered: Bool = false) {
+        drawToolbarButton(rect, active: active, hovered: hovered)
+        let line = NSBezierPath()
+        line.move(to: CGPoint(x: rect.minX + 9, y: rect.midY))
+        line.line(to: CGPoint(x: rect.maxX - 9, y: rect.midY))
+        line.lineWidth = width
+        line.lineCapStyle = .round
+        (active ? NSColor.white : NSColor.white.withAlphaComponent(0.85)).setStroke()
+        line.stroke()
     }
 
     private func colorPalette() -> [NSColor] {
@@ -973,6 +1057,7 @@ final class CaptureView: NSView, NSTextFieldDelegate {
         switch tool {
         case .text: return "textformat"
         case .rectangle: return "rectangle"
+        case .oval: return "oval"
         case .arrow: return "arrow.up.right"
         case .pen: return "pencil.tip"
         }
@@ -982,6 +1067,7 @@ final class CaptureView: NSView, NSTextFieldDelegate {
         switch tool {
         case .text: return "T"
         case .rectangle: return "▭"
+        case .oval: return "○"
         case .arrow: return "↗"
         case .pen: return "✎"
         }
@@ -998,9 +1084,12 @@ final class CaptureView: NSView, NSTextFieldDelegate {
                       withAttributes: attrs)
     }
 
-    private func beginTextEntry(at point: CGPoint, viewPoint: CGPoint) {
+    private func beginTextEntry(at point: CGPoint, viewPoint: CGPoint, text: String = "", editingIndex: Int? = nil) {
         commitTextEntry()
         let field = NSTextField(frame: CGRect(x: viewPoint.x, y: viewPoint.y - 3, width: 280, height: textSize + 14))
+        field.cell = VerticallyCenteredTextFieldCell(textCell: text)
+        field.isEditable = true
+        field.isSelectable = true
         field.font = .systemFont(ofSize: textSize, weight: .semibold)
         field.textColor = textColor
         field.backgroundColor = NSColor.black.withAlphaComponent(0.16)
@@ -1012,13 +1101,20 @@ final class CaptureView: NSView, NSTextFieldDelegate {
         field.layer?.cornerRadius = 5
         field.focusRingType = .none
         field.placeholderString = "输入文字，回车确认"
+        field.stringValue = text
         field.delegate = self
         field.target = self
         field.action = #selector(confirmTextEntry)
         addSubview(field)
         activeTextField = field
         activeTextPoint = point
-        window?.makeFirstResponder(field)
+        activeTextEditingIndex = editingIndex
+        DispatchQueue.main.async { [weak self, weak field] in
+            guard let self, let field, self.activeTextField === field else { return }
+            self.window?.makeFirstResponder(field)
+            field.selectText(nil)
+            field.currentEditor()?.selectAll(nil)
+        }
     }
 
     @objc private func confirmTextEntry() {
@@ -1027,17 +1123,26 @@ final class CaptureView: NSView, NSTextFieldDelegate {
     }
 
     func controlTextDidEndEditing(_ obj: Notification) {
-        commitTextEntry()
+        // Text is committed explicitly by Return, save, or clicking outside the field.
     }
 
     private func commitTextEntry() {
         guard let field = activeTextField else { return }
         let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let point = activeTextPoint
+        let editingIndex = activeTextEditingIndex
         activeTextField = nil
         activeTextPoint = nil
+        activeTextEditingIndex = nil
         field.removeFromSuperview()
-        if !text.isEmpty, let point {
+        if let editingIndex, annotations.indices.contains(editingIndex) {
+            if text.isEmpty {
+                annotations.remove(at: editingIndex)
+            } else if let point {
+                annotations[editingIndex] = .text(text, point, textSize, textColor)
+            }
+            needsDisplay = true
+        } else if !text.isEmpty, let point {
             annotations.append(.text(text, point, textSize, textColor))
             needsDisplay = true
         }
@@ -1048,67 +1153,84 @@ final class CaptureView: NSView, NSTextFieldDelegate {
         switch activeTool {
         case .text: break
         case .rectangle:
-            drawAnnotation(.rectangle(CGRect(x: min(start.x, end.x), y: min(start.y, end.y), width: abs(start.x - end.x), height: abs(start.y - end.y)), textColor))
+            Annotation.rectangle(rect(from: start, to: end), textColor, annotationLineWidth).draw()
+        case .oval:
+            Annotation.oval(rect(from: start, to: end), textColor, annotationLineWidth).draw()
         case .arrow:
-            drawAnnotation(.arrow(start, end, textColor))
+            Annotation.arrow(start, end, textColor, annotationLineWidth).draw()
         case .pen:
-            drawAnnotation(.pen(penPoints, textColor))
+            Annotation.pen(penPoints, textColor, annotationLineWidth).draw()
         }
     }
 
-    private func drawAnnotation(_ annotation: Annotation) {
-        let red = NSColor.systemRed
-        red.setStroke()
-        red.setFill()
-
-        switch annotation {
-        case let .text(text, point, size, color):
-            text.draw(at: point, withAttributes: [
-                .font: NSFont.systemFont(ofSize: size, weight: .semibold),
-                .foregroundColor: color
-            ])
-        case let .rectangle(rect, color):
-            color.setStroke()
-            let path = NSBezierPath(roundedRect: rect, xRadius: 3, yRadius: 3)
-            path.lineWidth = 4
-            path.stroke()
-        case let .arrow(start, end, color):
-            color.setStroke()
-            let path = NSBezierPath()
-            path.move(to: start)
-            path.line(to: end)
-            path.lineWidth = 4
-            path.lineCapStyle = .round
-            path.stroke()
-            let angle = atan2(end.y - start.y, end.x - start.x)
-            let length: CGFloat = 16
-            let head = NSBezierPath()
-            head.move(to: end)
-            head.line(to: CGPoint(x: end.x - length * cos(angle - .pi / 6), y: end.y - length * sin(angle - .pi / 6)))
-            head.move(to: end)
-            head.line(to: CGPoint(x: end.x - length * cos(angle + .pi / 6), y: end.y - length * sin(angle + .pi / 6)))
-            head.lineWidth = 4
-            head.stroke()
-        case let .pen(points, color):
-            color.setStroke()
-            guard let first = points.first else { return }
-            let path = NSBezierPath()
-            path.move(to: first)
-            points.dropFirst().forEach { path.line(to: $0) }
-            path.lineWidth = 4
-            path.lineCapStyle = .round
-            path.lineJoinStyle = .round
-            path.stroke()
+    private func textAnnotationIndex(at point: CGPoint) -> Int? {
+        for index in annotations.indices.reversed() {
+            guard case let .text(text, textPoint, size, _) = annotations[index] else { continue }
+            if textAnnotationBounds(text, point: textPoint, size: size).contains(point) {
+                return index
+            }
         }
+        return nil
+    }
+
+    private func prepareTextInteraction(at localPoint: CGPoint, mousePoint: CGPoint) -> Bool {
+        guard let textIndex = textAnnotationIndex(at: localPoint),
+              case let .text(_, textPoint, _, _) = annotations[textIndex] else { return false }
+        pendingTextIndex = textIndex
+        pendingTextOffset = CGPoint(x: localPoint.x - textPoint.x, y: localPoint.y - textPoint.y)
+        pendingTextMouseDownPoint = mousePoint
+        updateCursor(at: mousePoint)
+        return true
+    }
+
+    private func beginEditingTextAnnotation(at index: Int) {
+        guard let lockedSelection,
+              annotations.indices.contains(index),
+              case let .text(text, point, size, color) = annotations[index] else { return }
+        textSize = size
+        textColor = color
+        let viewPoint = CGPoint(x: lockedSelection.minX + point.x, y: lockedSelection.minY + point.y)
+        beginTextEntry(at: point, viewPoint: viewPoint, text: text, editingIndex: index)
+        needsDisplay = true
+    }
+
+    private func moveTextAnnotation(at index: Int, offset: CGPoint, to point: CGPoint) {
+        guard let lockedSelection,
+              annotations.indices.contains(index),
+              case let .text(text, _, size, color) = annotations[index] else { return }
+        let localPoint = CGPoint(x: min(max(point.x, lockedSelection.minX), lockedSelection.maxX) - lockedSelection.minX,
+                                 y: min(max(point.y, lockedSelection.minY), lockedSelection.maxY) - lockedSelection.minY)
+        let textSize = annotationTextSize(text, size: size)
+        let nextPoint = CGPoint(x: min(max(localPoint.x - offset.x, 0), max(0, lockedSelection.width - textSize.width)),
+                                y: min(max(localPoint.y - offset.y, 0), max(0, lockedSelection.height - textSize.height)))
+        annotations[index] = .text(text, nextPoint, size, color)
+        needsDisplay = true
+    }
+
+    private func textAnnotationBounds(_ text: String, point: CGPoint, size: CGFloat) -> CGRect {
+        let textSize = text.size(withAttributes: textAttributes(size: size))
+        return CGRect(origin: point, size: textSize).insetBy(dx: -8, dy: -6)
+    }
+
+    private func annotationTextSize(_ text: String, size: CGFloat) -> CGSize {
+        text.size(withAttributes: textAttributes(size: size))
+    }
+
+    private func textAttributes(size: CGFloat) -> [NSAttributedString.Key: Any] {
+        [.font: NSFont.systemFont(ofSize: size, weight: .semibold)]
     }
 
     private var selectionRect: CGRect? {
         guard let startPoint, let currentPoint else { return nil }
-        let rect = CGRect(x: min(startPoint.x, currentPoint.x),
-                          y: min(startPoint.y, currentPoint.y),
-                          width: abs(startPoint.x - currentPoint.x),
-                          height: abs(startPoint.y - currentPoint.y))
+        let rect = rect(from: startPoint, to: currentPoint)
         return rect.width > 4 && rect.height > 4 ? rect : nil
+    }
+
+    private func rect(from start: CGPoint, to end: CGPoint) -> CGRect {
+        CGRect(x: min(start.x, end.x),
+               y: min(start.y, end.y),
+               width: abs(start.x - end.x),
+               height: abs(start.y - end.y))
     }
 }
 
@@ -1117,5 +1239,23 @@ enum Clipboard {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.writeObjects([image])
+    }
+}
+
+enum SoundFeedback {
+    static func playSuccess() {
+        if let sound = NSSound(named: "Glass") ?? NSSound(named: "Ping") {
+            sound.play()
+        } else {
+            NSSound.beep()
+        }
+    }
+}
+
+private extension NSImage {
+    var pngData: Data? {
+        guard let tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiffRepresentation) else { return nil }
+        return bitmap.representation(using: .png, properties: [:])
     }
 }
