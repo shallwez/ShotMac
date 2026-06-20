@@ -1244,7 +1244,7 @@ enum Clipboard {
 
 enum SoundFeedback {
     static func playSuccess() {
-        if let sound = NSSound(named: "Glass") ?? NSSound(named: "Ping") {
+        if let sound = NSSound(named: "Pop") ?? NSSound(named: "Tink") {
             sound.play()
         } else {
             NSSound.beep()
