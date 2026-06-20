@@ -53,12 +53,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         NSApp.activate(ignoringOtherApps: true)
-        captureWindow?.orderOut(nil)
+        captureWindow?.dismiss()
         captureWindow = CaptureWindow { [weak self] rect, annotations, action in
             guard let rect, let annotations else { return }
             self?.capture(rect: rect, annotations: annotations, action: action)
         }
-        captureWindow?.makeKeyAndOrderFront(nil)
+        captureWindow?.present()
     }
 
     @objc private func quit() {
@@ -72,9 +72,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func buildStatusMenu() {
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.title = "截图"
-        item.button?.font = .systemFont(ofSize: 13, weight: .semibold)
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        item.button?.title = ""
+        item.button?.image = Self.statusBarIcon()
+        item.button?.imagePosition = .imageOnly
         item.button?.toolTip = "QuickMarkShot 截图（Option+A）"
 
         let menu = NSMenu()
@@ -94,6 +95,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = item
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "StatusMenuBuiltAt")
         NSLog("QuickMarkShot status menu built")
+    }
+
+    private static func statusBarIcon() -> NSImage {
+        if let image = NSImage(systemSymbolName: "camera.viewfinder", accessibilityDescription: "截图") {
+            image.isTemplate = true
+            return image
+        }
+
+        let image = NSImage(size: NSSize(width: 18, height: 18))
+        image.lockFocus()
+        NSColor.labelColor.setStroke()
+        let rect = NSRect(x: 2.5, y: 3.5, width: 13, height: 11)
+        let path = NSBezierPath(roundedRect: rect, xRadius: 2, yRadius: 2)
+        path.lineWidth = 1.6
+        path.stroke()
+
+        let lens = NSBezierPath(ovalIn: NSRect(x: 7, y: 6, width: 4, height: 4))
+        lens.lineWidth = 1.4
+        lens.stroke()
+
+        NSColor.labelColor.setFill()
+        NSBezierPath(roundedRect: NSRect(x: 5, y: 13, width: 4, height: 2.2),
+                     xRadius: 1,
+                     yRadius: 1).fill()
+        image.unlockFocus()
+        image.isTemplate = true
+        return image
     }
 
     private func configureLaunchAtLogin() {
@@ -253,36 +281,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func captureImage(in selection: CGRect) async throws -> NSImage {
-        let midpoint = CGPoint(x: selection.midX, y: selection.midY)
-        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(midpoint) }) ?? NSScreen.main,
-              let displayID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else {
-            throw CaptureError.displayNotFound
-        }
-
         let available = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-        guard let display = available.displays.first(where: { $0.displayID == displayID }) else {
-            throw CaptureError.displayNotFound
+        var captures: [(image: NSImage, rect: CGRect)] = []
+        for screen in NSScreen.screens {
+            guard let displayID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID,
+                  let display = available.displays.first(where: { $0.displayID == displayID }) else {
+                continue
+            }
+
+            let clipped = selection.intersection(screen.frame).integral
+            guard !clipped.isNull, !clipped.isEmpty else { continue }
+            let image = try await captureImage(on: screen, display: display, rect: clipped)
+            captures.append((image, clipped))
         }
 
-        let clipped = selection.intersection(screen.frame)
-        guard !clipped.isNull else { throw CaptureError.emptySelection }
+        guard !captures.isEmpty else { throw CaptureError.emptySelection }
+        if captures.count == 1, let capture = captures.first, capture.rect.equalTo(selection) {
+            return capture.image
+        }
+
+        let result = NSImage(size: selection.size)
+        result.lockFocus()
+        for capture in captures {
+            let destination = CGRect(x: capture.rect.minX - selection.minX,
+                                     y: capture.rect.minY - selection.minY,
+                                     width: capture.rect.width,
+                                     height: capture.rect.height)
+            capture.image.draw(in: destination,
+                               from: CGRect(origin: .zero, size: capture.image.size),
+                               operation: NSCompositingOperation.copy,
+                               fraction: 1)
+        }
+        result.unlockFocus()
+        return result
+    }
+
+    private func captureImage(on screen: NSScreen, display: SCDisplay, rect: CGRect) async throws -> NSImage {
         let sourceRect = CGRect(
-            x: clipped.minX - screen.frame.minX,
-            y: screen.frame.maxY - clipped.maxY,
-            width: clipped.width,
-            height: clipped.height
+            x: rect.minX - screen.frame.minX,
+            y: screen.frame.maxY - rect.maxY,
+            width: rect.width,
+            height: rect.height
         )
 
         let configuration = SCStreamConfiguration()
         configuration.sourceRect = sourceRect
-        configuration.width = Int(clipped.width * screen.backingScaleFactor)
-        configuration.height = Int(clipped.height * screen.backingScaleFactor)
+        configuration.width = Int(rect.width * screen.backingScaleFactor)
+        configuration.height = Int(rect.height * screen.backingScaleFactor)
         configuration.showsCursor = false
         configuration.captureResolution = .best
 
         let filter = SCContentFilter(display: display, excludingWindows: [])
         let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
-        return NSImage(cgImage: cgImage, size: clipped.size)
+        return NSImage(cgImage: cgImage, size: rect.size)
     }
 
     private func showAlert(title: String, message: String) {
@@ -320,6 +371,7 @@ private enum CaptureError: LocalizedError {
 
 final class CaptureWindow: NSWindow {
     private let completion: (CGRect?, [Annotation]?, CaptureAction) -> Void
+    private var overlayWindows: [CaptureOverlayWindow] = []
 
     init(completion: @escaping (CGRect?, [Annotation]?, CaptureAction) -> Void) {
         self.completion = completion
@@ -331,13 +383,141 @@ final class CaptureWindow: NSWindow {
         level = .screenSaver
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         ignoresMouseEvents = false
+        setFrame(frame, display: false)
         contentView = CaptureView(frame: CGRect(origin: .zero, size: frame.size)) { [weak self] rect, annotations, action in
-            self?.orderOut(nil)
+            self?.dismiss()
             self?.completion(rect, annotations, action)
         }
     }
 
+    func present() {
+        guard let captureView = contentView as? CaptureView else { return }
+        if overlayWindows.isEmpty {
+            overlayWindows = NSScreen.screens.map { screen in
+                CaptureOverlayWindow(screen: screen, sourceView: captureView, sourceWindow: self)
+            }
+        }
+
+        let mouseScreen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) }
+        for window in overlayWindows where window.screen !== mouseScreen {
+            window.orderFront(nil)
+        }
+        (overlayWindows.first { $0.screen === mouseScreen } ?? overlayWindows.first)?.makeKeyAndOrderFront(nil)
+        captureView.onDisplayNeeded = { [weak self] in
+            self?.overlayWindows.forEach { $0.contentView?.needsDisplay = true }
+        }
+        captureView.needsDisplay = true
+    }
+
+    func dismiss() {
+        (contentView as? CaptureView)?.onDisplayNeeded = nil
+        overlayWindows.forEach { $0.orderOut(nil) }
+        super.orderOut(nil)
+    }
+
     override var canBecomeKey: Bool { true }
+
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        frameRect
+    }
+}
+
+final class CaptureOverlayWindow: NSWindow {
+    init(screen: NSScreen, sourceView: CaptureView, sourceWindow: NSWindow) {
+        super.init(contentRect: screen.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        setFrame(screen.frame, display: false)
+        isOpaque = false
+        backgroundColor = .clear
+        animationBehavior = .none
+        level = .screenSaver
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        ignoresMouseEvents = false
+        contentView = CaptureOverlayView(frame: CGRect(origin: .zero, size: screen.frame.size),
+                                         sourceView: sourceView,
+                                         sourceWindow: sourceWindow)
+    }
+
+    override var canBecomeKey: Bool { true }
+}
+
+final class CaptureOverlayView: NSView {
+    private weak var sourceView: CaptureView?
+    private weak var sourceWindow: NSWindow?
+
+    init(frame: CGRect, sourceView: CaptureView, sourceWindow: NSWindow) {
+        self.sourceView = sourceView
+        self.sourceWindow = sourceWindow
+        super.init(frame: frame)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        window?.acceptsMouseMovedEvents = true
+        window?.makeFirstResponder(self)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let sourceView, let sourceWindow, let window else { return }
+        let sourceOrigin = sourceWindow.convertPoint(fromScreen: window.frame.origin)
+        NSGraphicsContext.saveGraphicsState()
+        let transform = NSAffineTransform()
+        transform.translateX(by: -sourceOrigin.x, yBy: -sourceOrigin.y)
+        transform.concat()
+        sourceView.draw(sourceView.bounds)
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
+    override func keyDown(with event: NSEvent) {
+        sourceView?.keyDown(with: event)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        forwardMouseEvent(event, type: .leftMouseDown) { $0.mouseDown(with: $1) }
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        forwardMouseEvent(event, type: .leftMouseDragged) { $0.mouseDragged(with: $1) }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        forwardMouseEvent(event, type: .leftMouseUp) { $0.mouseUp(with: $1) }
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        forwardMouseEvent(event, type: .rightMouseDown) { $0.rightMouseDown(with: $1) }
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        forwardMouseEvent(event, type: .mouseMoved) { $0.mouseMoved(with: $1) }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        sourceView?.mouseExited(with: event)
+    }
+
+    private func forwardMouseEvent(_ event: NSEvent,
+                                   type: NSEvent.EventType,
+                                   action: (CaptureView, NSEvent) -> Void) {
+        guard let sourceView, let sourceWindow, let window else { return }
+        let screenPoint = window.convertPoint(toScreen: event.locationInWindow)
+        let sourcePoint = sourceWindow.convertPoint(fromScreen: screenPoint)
+        guard let forwarded = NSEvent.mouseEvent(with: type,
+                                                 location: sourcePoint,
+                                                 modifierFlags: event.modifierFlags,
+                                                 timestamp: event.timestamp,
+                                                 windowNumber: sourceWindow.windowNumber,
+                                                 context: nil,
+                                                 eventNumber: event.eventNumber,
+                                                 clickCount: event.clickCount,
+                                                 pressure: event.pressure) else { return }
+        action(sourceView, forwarded)
+    }
 }
 
 final class CaptureView: NSView, NSTextFieldDelegate {
@@ -378,7 +558,9 @@ final class CaptureView: NSView, NSTextFieldDelegate {
     private let textSizeOptions: [CGFloat] = Array(stride(from: CGFloat(12), through: CGFloat(64), by: CGFloat(2)))
     private var hoverPoint: CGPoint?
     private var trackingArea: NSTrackingArea?
+    private var globalMouseMonitor: Any?
     private let completion: (CGRect?, [Annotation]?, CaptureAction) -> Void
+    var onDisplayNeeded: (() -> Void)?
 
     init(frame: CGRect, completion: @escaping (CGRect?, [Annotation]?, CaptureAction) -> Void) {
         self.completion = completion
@@ -391,7 +573,19 @@ final class CaptureView: NSView, NSTextFieldDelegate {
         fatalError("init(coder:) has not been implemented")
     }
 
+    deinit {
+        endGlobalMouseTracking()
+    }
+
     override var acceptsFirstResponder: Bool { true }
+
+    override var needsDisplay: Bool {
+        get { super.needsDisplay }
+        set {
+            super.needsDisplay = newValue
+            if newValue { onDisplayNeeded?() }
+        }
+    }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
@@ -440,6 +634,7 @@ final class CaptureView: NSView, NSTextFieldDelegate {
 
     override func mouseDown(with event: NSEvent) {
         let point = event.locationInWindow
+        beginGlobalMouseTracking()
         if let field = activeTextField, !field.frame.contains(point) {
             if let lockedSelection {
                 let buttons = actionButtonRects(for: lockedSelection)
@@ -535,11 +730,25 @@ final class CaptureView: NSView, NSTextFieldDelegate {
         needsDisplay = true
     }
 
+    override func rightMouseDown(with event: NSEvent) {
+        guard lockedSelection == nil else {
+            super.rightMouseDown(with: event)
+            return
+        }
+        startPoint = nil
+        currentPoint = nil
+        endGlobalMouseTracking()
+        completion(nil, nil, .copy)
+    }
+
     override func mouseDragged(with event: NSEvent) {
+        handleMouseDragged(at: localMousePoint(fallback: event.locationInWindow))
+    }
+
+    private func handleMouseDragged(at point: CGPoint) {
         if let textIndex = pendingTextIndex,
            let offset = pendingTextOffset,
            let mouseDownPoint = pendingTextMouseDownPoint {
-            let point = event.locationInWindow
             if hypot(point.x - mouseDownPoint.x, point.y - mouseDownPoint.y) < 3 {
                 return
             }
@@ -553,11 +762,10 @@ final class CaptureView: NSView, NSTextFieldDelegate {
         }
         if let textIndex = draggingTextIndex,
            let offset = draggingTextOffset {
-            moveTextAnnotation(at: textIndex, offset: offset, to: event.locationInWindow)
+            moveTextAnnotation(at: textIndex, offset: offset, to: point)
             return
         }
         if let activeTool, let lockedSelection, annotationStart != nil {
-            let point = event.locationInWindow
             let localPoint = CGPoint(x: min(max(point.x, lockedSelection.minX), lockedSelection.maxX) - lockedSelection.minX,
                                      y: min(max(point.y, lockedSelection.minY), lockedSelection.maxY) - lockedSelection.minY)
             annotationCurrent = localPoint
@@ -566,7 +774,6 @@ final class CaptureView: NSView, NSTextFieldDelegate {
             return
         }
         if let handle = resizeHandle, var rect = lockedSelection {
-            let point = event.locationInWindow
             let minimumSize: CGFloat = 24
             if handle.changesLeft {
                 let newMinX = min(max(point.x, bounds.minX), rect.maxX - minimumSize)
@@ -589,18 +796,22 @@ final class CaptureView: NSView, NSTextFieldDelegate {
             return
         }
         if let offset = moveOffset, var rect = lockedSelection {
-            let point = event.locationInWindow
             rect.origin.x = min(max(point.x - offset.x, bounds.minX), bounds.maxX - rect.width)
             rect.origin.y = min(max(point.y - offset.y, bounds.minY), bounds.maxY - rect.height)
             lockedSelection = rect
             needsDisplay = true
             return
         }
-        currentPoint = event.locationInWindow
+        currentPoint = point
         needsDisplay = true
     }
 
     override func mouseUp(with event: NSEvent) {
+        handleMouseUp(at: localMousePoint(fallback: event.locationInWindow))
+        endGlobalMouseTracking()
+    }
+
+    private func handleMouseUp(at point: CGPoint) {
         if let textIndex = pendingTextIndex {
             pendingTextIndex = nil
             pendingTextOffset = nil
@@ -611,7 +822,7 @@ final class CaptureView: NSView, NSTextFieldDelegate {
         if draggingTextIndex != nil {
             draggingTextIndex = nil
             draggingTextOffset = nil
-            updateCursor(at: event.locationInWindow)
+            updateCursor(at: point)
             needsDisplay = true
             return
         }
@@ -636,17 +847,17 @@ final class CaptureView: NSView, NSTextFieldDelegate {
         }
         if resizeHandle != nil {
             resizeHandle = nil
-            updateCursor(at: event.locationInWindow)
+            updateCursor(at: point)
             needsDisplay = true
             return
         }
         if moveOffset != nil {
             moveOffset = nil
-            updateCursor(at: event.locationInWindow)
+            updateCursor(at: point)
             needsDisplay = true
             return
         }
-        currentPoint = event.locationInWindow
+        currentPoint = point
         guard let selection = selectionRect else {
             startPoint = nil
             currentPoint = nil
@@ -659,6 +870,34 @@ final class CaptureView: NSView, NSTextFieldDelegate {
         startPoint = nil
         currentPoint = nil
         needsDisplay = true
+    }
+
+    private func beginGlobalMouseTracking() {
+        guard globalMouseMonitor == nil else { return }
+        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDragged, .leftMouseUp]) { [weak self] event in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let point = self.localMousePoint()
+                if event.type == .leftMouseDragged {
+                    self.handleMouseDragged(at: point)
+                } else {
+                    self.handleMouseUp(at: point)
+                    self.endGlobalMouseTracking()
+                }
+            }
+        }
+    }
+
+    private func endGlobalMouseTracking() {
+        if let globalMouseMonitor {
+            NSEvent.removeMonitor(globalMouseMonitor)
+            self.globalMouseMonitor = nil
+        }
+    }
+
+    private func localMousePoint(fallback: CGPoint? = nil) -> CGPoint {
+        guard let window else { return fallback ?? .zero }
+        return window.convertPoint(fromScreen: NSEvent.mouseLocation)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -808,10 +1047,25 @@ final class CaptureView: NSView, NSTextFieldDelegate {
         let showFontSize = isTextControlsVisible
         let showStrokeWidths = activeTool?.usesLineWidthControls == true
         let barSize = CGSize(width: showFontSize ? 632 : (showStrokeWidths ? 668 : 580), height: 50)
-        let x = min(max(selection.maxX - barSize.width, bounds.minX + 4), bounds.maxX - barSize.width - 4)
-        let y = selection.minY >= barSize.height + 8
-            ? selection.minY - barSize.height - 10
-            : min(selection.maxY + 10, bounds.maxY - barSize.height - 4)
+        let margin: CGFloat = 8
+        let gap: CGFloat = 10
+        let visibleBounds = visibleToolbarBounds(for: selection)
+        let maxX = max(visibleBounds.minX + margin, visibleBounds.maxX - barSize.width - margin)
+        let x = min(max(selection.maxX - barSize.width, visibleBounds.minX + margin), maxX)
+        let availableBelow = selection.minY - visibleBounds.minY - gap
+        let availableAbove = visibleBounds.maxY - selection.maxY - gap
+        let preferredY: CGFloat
+        if availableBelow >= barSize.height {
+            preferredY = selection.minY - barSize.height - gap
+        } else if availableAbove >= barSize.height {
+            preferredY = selection.maxY + gap
+        } else if availableAbove >= availableBelow {
+            preferredY = visibleBounds.maxY - barSize.height - margin
+        } else {
+            preferredY = visibleBounds.minY + margin
+        }
+        let maxY = max(visibleBounds.minY + margin, visibleBounds.maxY - barSize.height - margin)
+        let y = min(max(preferredY, visibleBounds.minY + margin), maxY)
         let bar = CGRect(origin: CGPoint(x: x, y: y), size: barSize)
         let colors = colorPalette().enumerated().map { index, color in
             (color: color, rect: CGRect(x: bar.minX + 12 + CGFloat(index) * 28,
@@ -841,6 +1095,25 @@ final class CaptureView: NSView, NSTextFieldDelegate {
             cancel: cancel,
             bar: bar
         )
+    }
+
+    private func visibleToolbarBounds(for selection: CGRect) -> CGRect {
+        guard let window else { return bounds }
+        let selectionMidpoint = CGPoint(x: selection.midX, y: selection.midY)
+        let screenPoint = window.convertPoint(toScreen: selectionMidpoint)
+        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(screenPoint) }) ?? NSScreen.main else {
+            return bounds
+        }
+
+        let visibleOrigin = window.convertPoint(fromScreen: screen.visibleFrame.origin)
+        let visibleMaxPoint = window.convertPoint(fromScreen: CGPoint(x: screen.visibleFrame.maxX,
+                                                                      y: screen.visibleFrame.maxY))
+        let visibleRect = CGRect(x: min(visibleOrigin.x, visibleMaxPoint.x),
+                                 y: min(visibleOrigin.y, visibleMaxPoint.y),
+                                 width: abs(visibleMaxPoint.x - visibleOrigin.x),
+                                 height: abs(visibleMaxPoint.y - visibleOrigin.y))
+        let clipped = visibleRect.intersection(bounds)
+        return clipped.isNull || clipped.isEmpty ? bounds : clipped
     }
 
     private func isPointInToolbar(_ point: CGPoint, buttons: ActionButtons) -> Bool {
