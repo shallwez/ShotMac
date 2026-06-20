@@ -80,13 +80,13 @@ QuickMarkShot 只在截图时读取选定的屏幕内容，图片会在本机处
 ## 构建命令
 
 ```sh
-# 构建 .app 和独立可执行文件
+# 构建 .app
 make app
 
 # 重新构建并重启应用
 make restart
 
-# 构建后在终端运行
+# 构建并打开应用
 make run
 ```
 
