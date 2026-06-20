@@ -8,6 +8,9 @@ import UniformTypeIdentifiers
 private let hotKeySignature = OSType(0x514d5348) // QMSH
 private let hotKeyID = UInt32(1)
 private let launchAgentLabel = "local.quickmarkshot.loginitem"
+private let captureWindowLevel = NSWindow.Level(
+    rawValue: Int(CGWindowLevelForKey(.maximumWindow))
+)
 
 enum CaptureAction {
     case copy
@@ -372,6 +375,9 @@ private enum CaptureError: LocalizedError {
 final class CaptureWindow: NSWindow {
     private let completion: (CGRect?, [Annotation]?, CaptureAction) -> Void
     private var overlayWindows: [CaptureOverlayWindow] = []
+    private var keepFrontTimer: Timer?
+    private var appObservers: [NSObjectProtocol] = []
+    private var workspaceObservers: [NSObjectProtocol] = []
 
     init(completion: @escaping (CGRect?, [Annotation]?, CaptureAction) -> Void) {
         self.completion = completion
@@ -380,8 +386,9 @@ final class CaptureWindow: NSWindow {
         isOpaque = false
         backgroundColor = .clear
         animationBehavior = .none
-        level = .screenSaver
-        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        level = captureWindowLevel
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        hidesOnDeactivate = false
         ignoresMouseEvents = false
         setFrame(frame, display: false)
         contentView = CaptureView(frame: CGRect(origin: .zero, size: frame.size)) { [weak self] rect, annotations, action in
@@ -398,11 +405,8 @@ final class CaptureWindow: NSWindow {
             }
         }
 
-        let mouseScreen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) }
-        for window in overlayWindows where window.screen !== mouseScreen {
-            window.orderFront(nil)
-        }
-        (overlayWindows.first { $0.screen === mouseScreen } ?? overlayWindows.first)?.makeKeyAndOrderFront(nil)
+        bringOverlaysToFront(makeKey: true)
+        startKeepingOverlaysInFront()
         captureView.onDisplayNeeded = { [weak self] in
             self?.overlayWindows.forEach {
                 ($0.contentView as? CaptureOverlayView)?.sourceDidChange()
@@ -412,9 +416,65 @@ final class CaptureWindow: NSWindow {
     }
 
     func dismiss() {
+        stopKeepingOverlaysInFront()
         (contentView as? CaptureView)?.onDisplayNeeded = nil
         overlayWindows.forEach { $0.orderOut(nil) }
         super.orderOut(nil)
+    }
+
+    private func startKeepingOverlaysInFront() {
+        stopKeepingOverlaysInFront()
+
+        let appCenter = NotificationCenter.default
+        appObservers.append(appCenter.addObserver(forName: NSApplication.didBecomeActiveNotification,
+                                                  object: NSApp,
+                                                  queue: .main) { [weak self] _ in
+            self?.reinforceTopmostPosition()
+        })
+
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        workspaceObservers.append(workspaceCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification,
+                                                              object: nil,
+                                                              queue: .main) { [weak self] _ in
+            self?.reinforceTopmostPosition()
+        })
+
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.reinforceTopmostPosition()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        keepFrontTimer = timer
+    }
+
+    private func stopKeepingOverlaysInFront() {
+        keepFrontTimer?.invalidate()
+        keepFrontTimer = nil
+        appObservers.forEach(NotificationCenter.default.removeObserver)
+        appObservers.removeAll()
+        workspaceObservers.forEach(NSWorkspace.shared.notificationCenter.removeObserver)
+        workspaceObservers.removeAll()
+    }
+
+    private func reinforceTopmostPosition() {
+        guard overlayWindows.contains(where: \.isVisible) else { return }
+        if !NSApp.isActive {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        bringOverlaysToFront(makeKey: NSApp.keyWindow == nil || !(NSApp.keyWindow is CaptureOverlayWindow))
+    }
+
+    private func bringOverlaysToFront(makeKey: Bool) {
+        let mouseScreen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) }
+        let keyCandidate = overlayWindows.first { $0.screen === mouseScreen } ?? overlayWindows.first
+        for window in overlayWindows where window !== keyCandidate {
+            window.level = captureWindowLevel
+            window.orderFrontRegardless()
+        }
+        keyCandidate?.level = captureWindowLevel
+        keyCandidate?.orderFrontRegardless()
+        if makeKey {
+            keyCandidate?.makeKey()
+        }
     }
 
     override var canBecomeKey: Bool { true }
@@ -431,8 +491,9 @@ final class CaptureOverlayWindow: NSWindow {
         isOpaque = false
         backgroundColor = .clear
         animationBehavior = .none
-        level = .screenSaver
-        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        level = captureWindowLevel
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        hidesOnDeactivate = false
         ignoresMouseEvents = false
         contentView = CaptureOverlayView(frame: CGRect(origin: .zero, size: screen.frame.size),
                                          sourceView: sourceView,
