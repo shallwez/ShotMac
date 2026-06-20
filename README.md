@@ -1,4 +1,5 @@
 # QuickMarkShot
+<img width="752" height="554" alt="image" src="https://github.com/user-attachments/assets/55c66e05-52cf-406b-85f8-cf349b121299" />
 
 QuickMarkShot 是一款轻量的原生 macOS 截图与标注工具。它常驻菜单栏，按下 `Option+A` 即可选取屏幕区域，完成标注后复制到剪贴板或保存为 PNG。
 
