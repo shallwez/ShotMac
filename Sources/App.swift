@@ -404,7 +404,9 @@ final class CaptureWindow: NSWindow {
         }
         (overlayWindows.first { $0.screen === mouseScreen } ?? overlayWindows.first)?.makeKeyAndOrderFront(nil)
         captureView.onDisplayNeeded = { [weak self] in
-            self?.overlayWindows.forEach { $0.contentView?.needsDisplay = true }
+            self?.overlayWindows.forEach {
+                ($0.contentView as? CaptureOverlayView)?.sourceDidChange()
+            }
         }
         captureView.needsDisplay = true
     }
@@ -443,6 +445,7 @@ final class CaptureOverlayWindow: NSWindow {
 final class CaptureOverlayView: NSView {
     private weak var sourceView: CaptureView?
     private weak var sourceWindow: NSWindow?
+    private var previousDamageBounds: CGRect = .null
 
     init(frame: CGRect, sourceView: CaptureView, sourceWindow: NSWindow) {
         self.sourceView = sourceView
@@ -471,6 +474,20 @@ final class CaptureOverlayView: NSView {
         transform.concat()
         sourceView.draw(sourceView.bounds)
         NSGraphicsContext.restoreGraphicsState()
+    }
+
+    func sourceDidChange() {
+        guard let sourceView, let sourceWindow, let window else { return }
+        let currentDamageBounds = sourceView.renderDamageBounds
+        var damageBounds = previousDamageBounds.union(currentDamageBounds)
+        previousDamageBounds = currentDamageBounds
+        guard !damageBounds.isNull, !damageBounds.isEmpty else { return }
+
+        let sourceOrigin = sourceWindow.convertPoint(fromScreen: window.frame.origin)
+        damageBounds = damageBounds.offsetBy(dx: -sourceOrigin.x, dy: -sourceOrigin.y)
+        let localDamageBounds = damageBounds.intersection(bounds)
+        guard !localDamageBounds.isNull, !localDamageBounds.isEmpty else { return }
+        setNeedsDisplay(localDamageBounds)
     }
 
     override func keyDown(with event: NSEvent) {
@@ -582,8 +599,11 @@ final class CaptureView: NSView, NSTextFieldDelegate {
     override var needsDisplay: Bool {
         get { super.needsDisplay }
         set {
-            super.needsDisplay = newValue
-            if newValue { onDisplayNeeded?() }
+            if newValue {
+                onDisplayNeeded?()
+            } else {
+                super.needsDisplay = false
+            }
         }
     }
 
@@ -932,6 +952,15 @@ final class CaptureView: NSView, NSTextFieldDelegate {
 
     private var activeSelection: CGRect? {
         lockedSelection ?? selectionRect
+    }
+
+    var renderDamageBounds: CGRect {
+        guard let selection = activeSelection else { return .null }
+        var damageBounds = selection.insetBy(dx: -18, dy: -58)
+        if lockedSelection != nil {
+            damageBounds = damageBounds.union(actionButtonRects(for: selection).bar.insetBy(dx: -4, dy: -4))
+        }
+        return damageBounds
     }
 
     private func drawSizeBadge(text: String, near rect: CGRect) {
